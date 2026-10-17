@@ -97,7 +97,7 @@ video { object-fit: cover; }
       <input id="sens" type="range" min="1" max="10" value="5">
       <output id="sensOut">5</output>
     </label>
-    <label class="toggle"><input id="sound" type="checkbox" checked>音・振動</label>
+    <label class="toggle"><input id="sound" type="checkbox" checked>音（ピピピピ）</label>
   </div>
   <p id="msg">準備中…</p>
 </div>
@@ -271,8 +271,8 @@ video { object-fit: cover; }
     const sd = Math.sqrt(all.reduce((a, x) => a + (x.s - mean) ** 2, 0) / all.length) || 1e-6;
     const sens = +$("sens").value;
     const zNeed = 3.4 - sens * 0.22;        // sens 5 -> z 2.3
-    const absNeed = 0.62 - sens * 0.02;     // sens 5 -> 0.52
-    const best = all.reduce((a, x) => (x.s > a.s ? x : a));    $("meter").innerHTML = "一致度 <b>" + Math.round(best.s * 100) + "</b>";
+    const absNeed = 0.945 - sens * 0.025;   // sens 5 -> 0.82 (tested: target ~0.95, best non-target ~0.75)
+    const best = all.reduce((a, x) => (x.s > a.s ? x : a));    $("meter").innerHTML = "一致度 <b>" + Math.round(best.s * 100) + "</b> / 鳴る基準 " + Math.round(absNeed * 100);
     const hits = all.filter((x) => x.s >= absNeed && (x.s - mean) / sd >= zNeed).sort((a, b) => b.s - a.s);
     const kept = [];
     for (const h of hits) if (kept.every((k) => iou(k.b, h.b) < 0.25 && !inside(h.b, k.b) && !inside(k.b, h.b))) kept.push(h);
@@ -290,18 +290,28 @@ video { object-fit: cover; }
   }
   function inside(a, b) { return a[0] >= b[0] - 0.02 && a[1] >= b[1] - 0.02 && a[2] <= b[2] + 0.02 && a[3] <= b[3] + 0.02; }
 
+  // "ピピピピ": 4 short beeps, repeated about once a second while something similar is on screen
+  function beeps(count) {
+    if (!audio) return;
+    if (audio.state === "suspended") audio.resume();
+    const t0 = audio.currentTime + 0.02;
+    for (let i = 0; i < count; i++) {
+      const t = t0 + i * 0.12;
+      const o = audio.createOscillator(), g = audio.createGain();
+      o.type = "square"; o.frequency.value = 2000;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.35, t + 0.005);
+      g.gain.setValueAtTime(0.35, t + 0.06);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.075);
+      o.connect(g).connect(audio.destination); o.start(t); o.stop(t + 0.08);
+    }
+  }
   function alertUser() {
     const now = performance.now();
-    if (now - lastAlert < 1200 || !$("sound").checked) return;
+    if (now - lastAlert < 1000 || !$("sound").checked) return;
     lastAlert = now;
-    try { navigator.vibrate?.(80); } catch {}
-    if (audio) {
-      const o = audio.createOscillator(), g = audio.createGain();
-      o.frequency.value = 1320; g.gain.setValueAtTime(0.0001, audio.currentTime);
-      g.gain.exponentialRampToValueAtTime(0.25, audio.currentTime + 0.01);
-      g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + 0.18);
-      o.connect(g).connect(audio.destination); o.start(); o.stop(audio.currentTime + 0.2);
-    }
+    try { navigator.vibrate?.([60, 60, 60, 60, 60, 60, 60]); } catch {}
+    beeps(4);
   }
 
   // ---------- drawing ----------
@@ -344,12 +354,15 @@ video { object-fit: cover; }
     if (on) step();
   }
   $("scan").onclick = () => toggleScan(!scanning);
-  $("sens").oninput = () => ($("sensOut").value = $("sens").value);
+  $("sound").onchange = () => { if ($("sound").checked) beeps(4); };   // test sound when turned on
+  $("sens").oninput =() => ($("sensOut").value = $("sens").value);
   addEventListener("resize", placeGuide);
 
   $("go").onclick = async () => {
     $("go").disabled = true;
-    try { audio = new (window.AudioContext || window.webkitAudioContext)(); } catch {}
+    // iPhone: let sound play even when the side switch is on silent (Safari 16.4+)
+    try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch {}
+    try { audio = new (window.AudioContext || window.webkitAudioContext)(); audio.resume(); beeps(1); } catch {}
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } } });
       video.srcObject = stream;
