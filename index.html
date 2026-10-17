@@ -136,8 +136,11 @@ video { object-fit: cover; }
   async function loadModel() {
     msg("画像認識モデルを読み込み中…（初回は数秒〜20秒）");
     await tf.ready();
-    model = await mobilenet.load({ version: 2, alpha: 1.0 });
+    model = await mobilenet.load({ version: 2, alpha: 0.75 });   // lighter model: less memory on phones
     tf.tidy(() => model.infer(tf.zeros([1, SIZE, SIZE, 3]), true));   // warm up
+    // The phone can take the GPU away (memory pressure); then only a reload helps.
+    const gl = tf.backend()?.gpgpu?.gl;
+    gl?.canvas?.addEventListener("webglcontextlost", (e) => { e.preventDefault(); gpuLost = true; fatal("スマホのメモリが足りなくなり、画像認識が止まりました。"); });
   }
 
   // Embed a batch [N,224,224,3] (0-255) -> L2-normalized [N,D]
@@ -242,24 +245,56 @@ video { object-fit: cover; }
     return out;
   }
 
-  async function step() {
-    if (!scanning) return;
-    if (!busy && refEmb && video.readyState >= 2) {
-      busy = true;
-      const boxes = windowsFor(SCALES[scaleIdx]);
-      const simT = tf.tidy(() => {
-        const frame = tf.browser.fromPixels(video).toFloat().expandDims(0);
-        const crops = tf.image.cropAndResize(frame, boxes, new Array(boxes.length).fill(0), [SIZE, SIZE]);
-        return embed(crops).matMul(refEmb.transpose()).max(1);
-      });
-      const sims = await simT.array();
-      simT.dispose();
-      scaleScores[scaleIdx] = { boxes, sims };
-      scaleIdx = (scaleIdx + 1) % SCALES.length;
-      judge();
-      busy = false;
+  // Small batches keep phone memory low; one frame is held while its windows are processed.
+  const CHUNK = 12;
+  let loopId = 0, errors = 0;
+  async function scaleSims(boxes) {
+    const frame = tf.tidy(() => tf.browser.fromPixels(video).toFloat().expandDims(0));
+    const sims = [];
+    try {
+      for (let i = 0; i < boxes.length; i += CHUNK) {
+        const part = boxes.slice(i, i + CHUNK);
+        const t = tf.tidy(() => {
+          const crops = tf.image.cropAndResize(frame, part, new Array(part.length).fill(0), [SIZE, SIZE]);
+          return embed(crops).matMul(refEmb.transpose()).max(1);
+        });
+        sims.push(...(await t.data()));
+        t.dispose();
+        if (!scanning) break;
+      }
+    } finally { frame.dispose(); }
+    return sims;
+  }
+  async function step(id) {
+    if (!scanning || id !== loopId) return;   // a newer loop replaced this one
+    if (!document.hidden && refEmb && video.readyState >= 2) {
+      try {
+        const boxes = windowsFor(SCALES[scaleIdx]);
+        const sims = await scaleSims(boxes);
+        if (sims.length === boxes.length) {
+          scaleScores[scaleIdx] = { boxes, sims };
+          scaleIdx = (scaleIdx + 1) % SCALES.length;
+          judge();
+        }
+        errors = 0;
+      } catch (e) {
+        errors++;
+        console.error(e);
+        if (gpuLost || errors >= 5) { fatal("画像認識が止まりました（" + (e?.message || e) + "）。"); return; }
+        msg("処理が追いつかず一瞬止まりました。続けて探しています…", true);
+        await new Promise((r) => setTimeout(r, 500));
+      }
     }
-    setTimeout(step, 30);
+    setTimeout(() => step(id), document.hidden ? 500 : 30);
+  }
+  let gpuLost = false;
+  function fatal(text) {
+    scanning = false; loopId++;
+    $("scan").textContent = "探す"; $("scan").disabled = true; $("capture").disabled = true;
+    const m = $("msg"); m.textContent = text + " "; m.classList.add("err");
+    const b = document.createElement("button"); b.type = "button"; b.className = "btn"; b.textContent = "再読み込み";
+    b.style.cssText = "padding:6px 12px;font-size:13px;margin-left:4px"; b.onclick = () => location.reload();
+    m.append(b);
   }
 
   // Sensitivity 1..10 -> how far above the rest of the scene a window must stand out
@@ -351,12 +386,32 @@ video { object-fit: cover; }
     $("capture").disabled = on;
     detections = []; scaleScores.length = 0; $("meter").textContent = "";
     msg(on ? "スキャン中。棚にゆっくりカメラを向けてください。" : "見本 " + refs.length + " 枚。「探す」を押して棚に向けてください。");
-    if (on) step();
+    loopId++;
+    if (on) step(loopId);
   }
   $("scan").onclick = () => toggleScan(!scanning);
   $("sound").onchange = () => { if ($("sound").checked) beeps(4); };   // test sound when turned on
   $("sens").oninput =() => ($("sensOut").value = $("sens").value);
   addEventListener("resize", placeGuide);
+
+  async function startCamera() {
+    video.srcObject?.getTracks().forEach((t) => t.stop());
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } } });
+    video.srcObject = stream;
+    await video.play();
+  }
+  // After the screen locks or another app is opened, the phone may stop the camera: restart it on return.
+  document.addEventListener("visibilitychange", async () => {
+    if (document.hidden || !$("start").hidden) return;
+    const track = video.srcObject?.getVideoTracks()[0];
+    try {
+      if (!track || track.readyState === "ended") await startCamera();
+      else await video.play();
+      if (audio?.state === "suspended") audio.resume();
+    } catch (e) {
+      fatal("カメラを再開できませんでした（" + (e.name || e) + "）。");
+    }
+  });
 
   $("go").onclick = async () => {
     $("go").disabled = true;
@@ -364,9 +419,7 @@ video { object-fit: cover; }
     try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch {}
     try { audio = new (window.AudioContext || window.webkitAudioContext)(); audio.resume(); beeps(1); } catch {}
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } } });
-      video.srcObject = stream;
-      await video.play();
+      await startCamera();
     } catch (e) {
       $("go").disabled = false;
       $("startMsg").textContent = "カメラを起動できませんでした。ブラウザの設定でカメラを許可してください。（" + (e.name || e) + "）";
